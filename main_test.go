@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -138,6 +139,96 @@ func TestListWorkspacesShowsExpirationStates(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("list output missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestListWorkspacesShowsTruncatedNote(t *testing.T) {
+	cfg := testConfig(t)
+	path, err := workspace.CreateWithOptions(cfg, workspace.CreateOptions{Name: "noted", Template: "sqlite", Now: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := workspace.SetNote(path, "checking sqlite WAL behavior with a longer note"); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := listWorkspaces(cfg, &out); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "NOTE") || !strings.Contains(got, "checking sqlite WAL behavio...") {
+		t.Fatalf("list output did not include truncated note:\n%s", got)
+	}
+}
+
+func TestRmRefusesPinnedWithoutForce(t *testing.T) {
+	cfg := testConfig(t)
+	path, err := workspace.Create(cfg, "pinned", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := workspace.Pin(path, true); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := rmWorkspace(cfg, []string{"pinned", "--yes"}, &out, &out, strings.NewReader("")); err == nil {
+		t.Fatal("rmWorkspace deleted pinned workspace without force")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("pinned workspace missing after refused rm: %v", err)
+	}
+}
+
+func TestRmForceDeletesPinned(t *testing.T) {
+	cfg := testConfig(t)
+	path, err := workspace.Create(cfg, "pinned", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := workspace.Pin(path, true); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := rmWorkspace(cfg, []string{"pinned", "--force", "--yes"}, &out, &out, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("workspace still exists or unexpected error: %v", err)
+	}
+}
+
+func TestSizeWorkspacesSkipsNonWorkspaceDirectories(t *testing.T) {
+	cfg := testConfig(t)
+	path, err := workspace.Create(cfg, "real", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "a.txt"), []byte("12345"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(cfg.WorkspacesDir, "not-workspace"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := sizeWorkspaces(cfg, nil, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "real") || strings.Contains(got, "not-workspace") {
+		t.Fatalf("unexpected size output:\n%s", got)
+	}
+}
+
+func TestDoctorReportsMissingOptionalToolsWithoutFailing(t *testing.T) {
+	cfg := testConfig(t)
+	t.Setenv("PATH", "")
+	var out bytes.Buffer
+	if err := doctor(cfg, &out); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Tools") || !strings.Contains(got, "python3: missing") {
+		t.Fatalf("doctor output missing tools:\n%s", got)
 	}
 }
 

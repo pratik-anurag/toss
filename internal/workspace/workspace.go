@@ -27,10 +27,13 @@ type Config struct {
 type Info struct {
 	Name     string
 	Template string
+	DirName  string
 	Path     string
 	Created  time.Time
 	Modified time.Time
 	Expires  *time.Time
+	Pinned   bool
+	Note     string
 	Size     int64
 }
 
@@ -47,11 +50,31 @@ type Metadata struct {
 	Template  string     `json:"template"`
 	CreatedAt time.Time  `json:"created_at"`
 	ExpiresAt *time.Time `json:"expires_at"`
+	Pinned    bool       `json:"pinned"`
+	Note      string     `json:"note"`
 }
 
 type CleanCandidate struct {
 	Info
 	Reason string
+}
+
+type MatchError struct {
+	Query   string
+	Matches []Info
+}
+
+func (e MatchError) Error() string {
+	if len(e.Matches) == 0 {
+		return fmt.Sprintf("no workspace matches %q", e.Query)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "multiple workspaces match %q\n\n", e.Query)
+	for i, item := range e.Matches {
+		fmt.Fprintf(&b, "  %d  %-24s  %-8s  %s\n", i+1, item.Name, item.Template, item.Path)
+	}
+	fmt.Fprintf(&b, "\nRun one of:\n  toss cd 1\n  toss cd %s", e.Matches[0].Name)
+	return b.String()
 }
 
 func ConfigFromEnv() (Config, error) {
@@ -154,10 +177,48 @@ func List(cfg Config) ([]Info, error) {
 	}
 
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].Created.Before(out[j].Created)
+		return out[i].Modified.After(out[j].Modified)
 	})
 
 	return out, nil
+}
+
+func Find(cfg Config, query string) (Info, error) {
+	items, err := List(cfg)
+	if err != nil {
+		return Info{}, err
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return Info{}, errors.New("workspace query cannot be empty")
+	}
+	if query == "latest" {
+		if len(items) == 0 {
+			return Info{}, MatchError{Query: query}
+		}
+		return items[0], nil
+	}
+	if n, ok := parseIndex(query); ok {
+		if n < 1 || n > len(items) {
+			return Info{}, fmt.Errorf("workspace index %d is out of range", n)
+		}
+		return items[n-1], nil
+	}
+
+	var matches []Info
+	needle := strings.ToLower(query)
+	for _, item := range items {
+		if strings.Contains(strings.ToLower(item.Name), needle) ||
+			strings.Contains(strings.ToLower(item.DirName), needle) ||
+			strings.Contains(strings.ToLower(item.Template), needle) ||
+			strings.Contains(strings.ToLower(item.Note), needle) {
+			matches = append(matches, item)
+		}
+	}
+	if len(matches) != 1 {
+		return Info{}, MatchError{Query: query, Matches: matches}
+	}
+	return matches[0], nil
 }
 
 func Keep(cfg Config, name, cwd string) (string, error) {
@@ -215,7 +276,7 @@ func FindActive(cfg Config, cwd string) (string, error) {
 	return "", errors.New("not inside a toss workspace")
 }
 
-func CleanCandidates(cfg Config, now time.Time, olderThan time.Duration, force, expiredOnly bool) ([]CleanCandidate, error) {
+func CleanCandidates(cfg Config, now time.Time, olderThan time.Duration, force, expiredOnly, includePinned bool) ([]CleanCandidate, error) {
 	items, err := List(cfg)
 	if err != nil {
 		return nil, err
@@ -223,6 +284,9 @@ func CleanCandidates(cfg Config, now time.Time, olderThan time.Duration, force, 
 
 	var candidates []CleanCandidate
 	for _, item := range items {
+		if item.Pinned && !includePinned {
+			continue
+		}
 		expired := item.Expires != nil && !now.Before(*item.Expires)
 		old := now.Sub(item.Modified) >= olderThan
 		if expiredOnly && !expired {
@@ -273,6 +337,88 @@ func Delete(cfg Config, path string) error {
 	}
 
 	return os.RemoveAll(path)
+}
+
+func Pin(path string, pinned bool) error {
+	meta := MetadataForWorkspace(path)
+	meta.Pinned = pinned
+	return WriteMetadata(path, meta)
+}
+
+func SetNote(path, note string) error {
+	if strings.ContainsAny(note, "\r\n") {
+		return errors.New("note cannot contain newlines")
+	}
+	if len([]rune(note)) > 200 {
+		return errors.New("note cannot be longer than 200 characters")
+	}
+	meta := MetadataForWorkspace(path)
+	meta.Note = note
+	return WriteMetadata(path, meta)
+}
+
+func Rename(cfg Config, item Info, newName string) (string, error) {
+	slug := Slug(newName)
+	if slug == "" {
+		return "", errors.New("workspace name must contain at least one letter or number")
+	}
+	src, err := normalizePath(item.Path)
+	if err != nil {
+		return "", err
+	}
+	root, err := normalizePath(cfg.WorkspacesDir)
+	if err != nil {
+		return "", err
+	}
+	if !isWithin(src, root) || src == root {
+		return "", fmt.Errorf("refusing to rename outside workspaces directory: %s", src)
+	}
+	if !hasMarker(src) {
+		return "", fmt.Errorf("refusing to rename unmarked directory: %s", src)
+	}
+	destName := renamedDirName(filepath.Base(src), slug)
+	dest := filepath.Join(root, destName)
+	if !isWithin(dest, root) || dest == root {
+		return "", fmt.Errorf("refusing unsafe rename destination: %s", dest)
+	}
+	if _, err := os.Lstat(dest); err == nil {
+		return "", fmt.Errorf("destination already exists: %s", dest)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	meta := MetadataForWorkspace(src)
+	meta.Name = slug
+	if err := WriteMetadata(src, meta); err != nil {
+		return "", err
+	}
+	if err := os.Rename(src, dest); err != nil {
+		return "", err
+	}
+	return dest, nil
+}
+
+func WorkspaceSize(path string) int64 {
+	var size int64
+	_ = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info.Mode().IsRegular() {
+			size += info.Size()
+		}
+		return nil
+	})
+	return size
 }
 
 func ParseAge(raw string) (time.Duration, error) {
@@ -373,6 +519,8 @@ func inspect(path string) (Info, error) {
 	template := "blank"
 	if metaOK && meta.Template != "" {
 		template = meta.Template
+	} else if !metaOK {
+		template = "unknown"
 	}
 	name := filepath.Base(path)
 	if metaOK && meta.Name != "" {
@@ -381,10 +529,13 @@ func inspect(path string) (Info, error) {
 	return Info{
 		Name:     name,
 		Template: template,
+		DirName:  filepath.Base(path),
 		Path:     path,
 		Created:  created,
 		Modified: newest,
 		Expires:  meta.ExpiresAt,
+		Pinned:   meta.Pinned,
+		Note:     meta.Note,
 		Size:     size,
 	}, nil
 }
@@ -411,7 +562,7 @@ func MetadataForWorkspace(path string) Metadata {
 			meta.Name = Slug(filepath.Base(path))
 		}
 		if meta.Template == "" {
-			meta.Template = "blank"
+			meta.Template = "unknown"
 		}
 		return meta
 	}
@@ -423,9 +574,11 @@ func MetadataForWorkspace(path string) Metadata {
 	return Metadata{
 		Version:   1,
 		Name:      Slug(filepath.Base(path)),
-		Template:  "blank",
+		Template:  "unknown",
 		CreatedAt: created,
 		ExpiresAt: nil,
+		Pinned:    false,
+		Note:      "",
 	}
 }
 
@@ -454,6 +607,27 @@ func ClearTTL(path string) error {
 	meta := MetadataForWorkspace(path)
 	meta.ExpiresAt = nil
 	return WriteMetadata(path, meta)
+}
+
+func parseIndex(raw string) (int, bool) {
+	var n int
+	for _, r := range raw {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n, raw != ""
+}
+
+func renamedDirName(oldName, slug string) string {
+	parts := strings.Split(oldName, "-")
+	if len(parts) >= 6 && len(parts[0]) == 4 && len(parts[1]) == 2 && len(parts[2]) == 2 && len(parts[3]) == 4 {
+		prefix := strings.Join(parts[:4], "-")
+		suffix := parts[len(parts)-1]
+		return prefix + "-" + slug + "-" + suffix
+	}
+	return slug
 }
 
 func expiresAt(now time.Time, ttl time.Duration) *time.Time {

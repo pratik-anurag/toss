@@ -30,10 +30,17 @@ toss new api-test
 toss new api-test --lang flask
 toss new api-test --lang flask --ttl 12h
 toss ls
+toss cd api-test
 toss path
 toss ttl 2d
 toss ttl clear
+toss pin
+toss note "checking token refresh behavior"
+toss rename auth-refresh-spike
+toss size
+toss doctor
 toss keep my-real-project
+toss rm api-test
 toss clean --dry-run
 toss clean --older-than 3d
 toss clean --expired --yes
@@ -137,6 +144,27 @@ toss-bin clean --expired --yes
 ```
 
 Workspaces without TTL do not expire. They remain until cleaned by age-based cleanup, manually deleted, or promoted with `toss keep`.
+
+## Small workspace utilities
+
+```sh
+toss new auth-spike --lang go --ttl 2d
+toss note "checking token refresh behavior"
+toss pin
+
+cd ~
+toss cd auth-spike
+
+toss size
+toss rename auth-refresh-spike
+
+toss unpin
+toss rm auth-refresh-spike
+```
+
+`toss cd` requires the shell wrapper from `eval "$(toss-bin init)"`.
+
+`toss pin` protects a workspace from cleanup. `toss note` helps remember why a workspace exists. `toss rename` renames the disposable workspace without promoting it. `toss rm` deletes one workspace safely. `toss size` helps find large scratch directories. `toss doctor` helps debug setup problems.
 
 ## Safety
 

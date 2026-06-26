@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -100,6 +101,9 @@ func TestListHandlesLegacyMarker(t *testing.T) {
 	if items[0].Expires != nil {
 		t.Fatalf("legacy Expires = %v, want nil", items[0].Expires)
 	}
+	if items[0].Template != "unknown" {
+		t.Fatalf("legacy Template = %q, want unknown", items[0].Template)
+	}
 }
 
 func TestFindActiveFromNestedDirectory(t *testing.T) {
@@ -173,7 +177,7 @@ func TestCleanCandidatesIncludesExpiredTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	candidates, err := CleanCandidates(cfg, now, 7*24*time.Hour, true, false)
+	candidates, err := CleanCandidates(cfg, now, 7*24*time.Hour, true, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +204,7 @@ func TestCleanExpiredOnlySkipsOldNonTTLWorkspace(t *testing.T) {
 		t.Fatal("test setup created duplicate paths")
 	}
 
-	candidates, err := CleanCandidates(cfg, now, 7*24*time.Hour, true, true)
+	candidates, err := CleanCandidates(cfg, now, 7*24*time.Hour, true, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,12 +223,213 @@ func TestCleanDoesNotDeleteRecentlyModifiedExpiredTTLWithoutForce(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	candidates, err := CleanCandidates(cfg, now, 7*24*time.Hour, false, false)
+	candidates, err := CleanCandidates(cfg, now, 7*24*time.Hour, false, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(candidates) != 0 {
 		t.Fatalf("CleanCandidates returned %d candidates, want 0", len(candidates))
+	}
+}
+
+func TestFindLatestAndNumericUseListOrdering(t *testing.T) {
+	cfg := testConfig(t)
+	now := time.Now()
+	first, err := CreateWithOptions(cfg, CreateOptions{Name: "first", Template: "go", Now: now.Add(-time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := CreateWithOptions(cfg, CreateOptions{Name: "second", Template: "rust", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(first, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(second, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	latest, err := Find(cfg, "latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Path != second {
+		t.Fatalf("latest = %q, want %q", latest.Path, second)
+	}
+	third, err := Find(cfg, "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Path != first {
+		t.Fatalf("index 2 = %q, want %q", third.Path, first)
+	}
+}
+
+func TestFindByQueryAndAmbiguous(t *testing.T) {
+	cfg := testConfig(t)
+	now := time.Now()
+	api, err := CreateWithOptions(cfg, CreateOptions{Name: "api-test", Template: "flask", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateWithOptions(cfg, CreateOptions{Name: "auth-api", Template: "go", Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	match, err := Find(cfg, "flask")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if match.Path != api {
+		t.Fatalf("Find(flask) = %q, want %q", match.Path, api)
+	}
+	if _, err := Find(cfg, "api"); err == nil {
+		t.Fatal("Find(api) succeeded, want ambiguous error")
+	}
+}
+
+func TestPinnedWorkspacesSkippedByCleanUnlessIncluded(t *testing.T) {
+	cfg := testConfig(t)
+	now := time.Now()
+	path, err := CreateWithOptions(cfg, CreateOptions{Name: "old", Template: "blank", Now: now.Add(-10 * 24 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Pin(path, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, now.Add(-10*24*time.Hour), now.Add(-10*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(path, MarkerFile), now.Add(-10*24*time.Hour), now.Add(-10*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	skipped, err := CleanCandidates(cfg, now, 7*24*time.Hour, true, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("pinned candidate was not skipped: %+v", skipped)
+	}
+	included, err := CleanCandidates(cfg, now, 7*24*time.Hour, true, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(included) != 1 {
+		t.Fatalf("include pinned returned %d candidates, want 1", len(included))
+	}
+}
+
+func TestPinNoteAndLegacyRewrite(t *testing.T) {
+	cfg := testConfig(t)
+	dir := filepath.Join(cfg.WorkspacesDir, "2026-06-26-1530-legacy-a8f2")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, MarkerFile), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Pin(dir, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetNote(dir, "checking sqlite WAL behavior"); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := ReadMetadata(dir)
+	if !ok {
+		t.Fatal("legacy marker was not rewritten as JSON")
+	}
+	if !meta.Pinned || meta.Note != "checking sqlite WAL behavior" {
+		t.Fatalf("unexpected metadata: %+v", meta)
+	}
+	if err := Pin(dir, false); err != nil {
+		t.Fatal(err)
+	}
+	meta, _ = ReadMetadata(dir)
+	if meta.Pinned {
+		t.Fatal("Pin(false) left workspace pinned")
+	}
+}
+
+func TestSetNoteValidation(t *testing.T) {
+	cfg := testConfig(t)
+	path, err := Create(cfg, "note", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SetNote(path, strings.Repeat("x", 201)); err == nil {
+		t.Fatal("SetNote accepted a long note")
+	}
+	if err := SetNote(path, "hello\nthere"); err == nil {
+		t.Fatal("SetNote accepted a newline")
+	}
+}
+
+func TestRenamePreservesTimestampAndSuffix(t *testing.T) {
+	cfg := testConfig(t)
+	path, err := CreateWithOptions(cfg, CreateOptions{Name: "scratch", Template: "blank", Now: time.Date(2026, 6, 26, 15, 30, 0, 0, time.UTC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := Find(cfg, "scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPath, err := Rename(cfg, item, "auth-spike")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Base(newPath)
+	if !strings.HasPrefix(base, "2026-06-26-1530-auth-spike-") {
+		t.Fatalf("renamed basename = %q", base)
+	}
+	meta, ok := ReadMetadata(newPath)
+	if !ok || meta.Name != "auth-spike" {
+		t.Fatalf("metadata after rename = %+v ok=%v", meta, ok)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("old path still exists or unexpected error: %v", err)
+	}
+}
+
+func TestRenameRefusesCollision(t *testing.T) {
+	cfg := testConfig(t)
+	now := time.Date(2026, 6, 26, 15, 30, 0, 0, time.UTC)
+	path, err := CreateWithOptions(cfg, CreateOptions{Name: "scratch", Template: "blank", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := Find(cfg, "scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(cfg.WorkspacesDir, strings.Replace(filepath.Base(path), "scratch", "auth-spike", 1))
+	if err := os.Mkdir(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Rename(cfg, item, "auth-spike"); err == nil {
+		t.Fatal("Rename succeeded despite destination collision")
+	}
+}
+
+func TestWorkspaceSizeSkipsSymlinks(t *testing.T) {
+	cfg := testConfig(t)
+	path, err := Create(cfg, "size", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "file.txt"), []byte("12345"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte(strings.Repeat("x", 1000)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(path, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if got := WorkspaceSize(path); got < 5 || got >= 1000 {
+		t.Fatalf("WorkspaceSize = %d, want regular file only", got)
 	}
 }
 
