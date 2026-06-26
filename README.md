@@ -25,13 +25,18 @@ Put that line in your shell config, such as `~/.zshrc` or `~/.bashrc`.
 ```sh
 toss
 toss --lang python
+toss --ttl 3d
 toss new api-test
 toss new api-test --lang flask
+toss new api-test --lang flask --ttl 12h
 toss ls
 toss path
+toss ttl 2d
+toss ttl clear
 toss keep my-real-project
 toss clean --dry-run
 toss clean --older-than 3d
+toss clean --expired --yes
 ```
 
 Workspaces live under `~/.toss/workspaces` by default. Set `TOSS_HOME` to use a different base directory.
@@ -109,6 +114,29 @@ sqlite3 app.db < seed.sql
 sqlite3 app.db < queries.sql
 toss keep notes-db
 ```
+
+## TTL / expiring workspaces
+
+`toss` does not run a background daemon. TTL is stored as metadata in the workspace `.toss` file and enforced when `toss clean` runs.
+
+```sh
+toss new spike --lang go --ttl 2d
+go run .
+```
+
+After 2 days, this workspace is eligible for deletion:
+
+```sh
+toss clean --expired
+```
+
+For automatic cleanup, run this from cron or another scheduler:
+
+```sh
+toss-bin clean --expired --yes
+```
+
+Workspaces without TTL do not expire. They remain until cleaned by age-based cleanup, manually deleted, or promoted with `toss keep`.
 
 ## Safety
 

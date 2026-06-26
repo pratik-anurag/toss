@@ -3,6 +3,7 @@ package workspace
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -25,10 +26,32 @@ type Config struct {
 
 type Info struct {
 	Name     string
+	Template string
 	Path     string
 	Created  time.Time
 	Modified time.Time
+	Expires  *time.Time
 	Size     int64
+}
+
+type CreateOptions struct {
+	Name     string
+	Template string
+	TTL      time.Duration
+	Now      time.Time
+}
+
+type Metadata struct {
+	Version   int        `json:"version"`
+	Name      string     `json:"name"`
+	Template  string     `json:"template"`
+	CreatedAt time.Time  `json:"created_at"`
+	ExpiresAt *time.Time `json:"expires_at"`
+}
+
+type CleanCandidate struct {
+	Info
+	Reason string
 }
 
 func ConfigFromEnv() (Config, error) {
@@ -63,7 +86,17 @@ func ConfigFromEnv() (Config, error) {
 }
 
 func Create(cfg Config, name string, now time.Time) (string, error) {
-	slug := Slug(name)
+	return CreateWithOptions(cfg, CreateOptions{Name: name, Template: "blank", Now: now})
+}
+
+func CreateWithOptions(cfg Config, opts CreateOptions) (string, error) {
+	if opts.Template == "" {
+		opts.Template = "blank"
+	}
+	if opts.Now.IsZero() {
+		opts.Now = time.Now()
+	}
+	slug := Slug(opts.Name)
 	if slug == "" {
 		return "", errors.New("workspace name must contain at least one letter or number")
 	}
@@ -72,15 +105,20 @@ func Create(cfg Config, name string, now time.Time) (string, error) {
 	}
 
 	for attempts := 0; attempts < 10; attempts++ {
-		dir := filepath.Join(cfg.WorkspacesDir, fmt.Sprintf("%s-%s-%s", now.Format("2006-01-02-1504"), slug, randomSuffix()))
+		dir := filepath.Join(cfg.WorkspacesDir, fmt.Sprintf("%s-%s-%s", opts.Now.Format("2006-01-02-1504"), slug, randomSuffix()))
 		if err := os.Mkdir(dir, 0o755); err != nil {
 			if os.IsExist(err) {
 				continue
 			}
 			return "", err
 		}
-		marker := filepath.Join(dir, MarkerFile)
-		if err := os.WriteFile(marker, []byte("toss workspace\n"), 0o644); err != nil {
+		if err := WriteMetadata(dir, Metadata{
+			Version:   1,
+			Name:      slug,
+			Template:  opts.Template,
+			CreatedAt: opts.Now,
+			ExpiresAt: expiresAt(opts.Now, opts.TTL),
+		}); err != nil {
 			_ = os.RemoveAll(dir)
 			return "", err
 		}
@@ -177,21 +215,30 @@ func FindActive(cfg Config, cwd string) (string, error) {
 	return "", errors.New("not inside a toss workspace")
 }
 
-func CleanCandidates(cfg Config, now time.Time, olderThan time.Duration, force bool) ([]Info, error) {
+func CleanCandidates(cfg Config, now time.Time, olderThan time.Duration, force, expiredOnly bool) ([]CleanCandidate, error) {
 	items, err := List(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	var candidates []Info
+	var candidates []CleanCandidate
 	for _, item := range items {
-		if now.Sub(item.Modified) < olderThan {
+		expired := item.Expires != nil && !now.Before(*item.Expires)
+		old := now.Sub(item.Modified) >= olderThan
+		if expiredOnly && !expired {
+			continue
+		}
+		if !expiredOnly && !expired && !old {
 			continue
 		}
 		if !force && now.Sub(item.Modified) < 24*time.Hour {
 			continue
 		}
-		candidates = append(candidates, item)
+		reason := fmt.Sprintf("older than %s", FormatDuration(olderThan))
+		if expired {
+			reason = "expired TTL"
+		}
+		candidates = append(candidates, CleanCandidate{Info: item, Reason: reason})
 	}
 
 	return candidates, nil
@@ -220,6 +267,10 @@ func Delete(cfg Config, path string) error {
 	if !hasMarker(path) {
 		return fmt.Errorf("refusing to delete unmarked directory: %s", path)
 	}
+	marker := filepath.Join(path, MarkerFile)
+	if !isWithin(marker, path) {
+		return fmt.Errorf("refusing unsafe marker path: %s", marker)
+	}
 
 	return os.RemoveAll(path)
 }
@@ -236,19 +287,32 @@ func ParseAge(raw string) (time.Duration, error) {
 			return 0, fmt.Errorf("invalid age %q", raw)
 		}
 		d := days * 24
-		if d < 0 {
+		if d <= 0 {
 			return 0, errors.New("age must be positive")
 		}
 		return d, nil
+	}
+	if !strings.HasSuffix(raw, "h") && !strings.HasSuffix(raw, "m") {
+		return 0, fmt.Errorf("invalid age %q", raw)
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
 		return 0, fmt.Errorf("invalid age %q", raw)
 	}
-	if d < 0 {
+	if d <= 0 {
 		return 0, errors.New("age must be positive")
 	}
 	return d, nil
+}
+
+func FormatDuration(d time.Duration) string {
+	if d%(24*time.Hour) == 0 {
+		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
+	}
+	if d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	}
+	return fmt.Sprintf("%dm", int(d/time.Minute))
 }
 
 var slugRe = regexp.MustCompile(`-+`)
@@ -298,17 +362,106 @@ func inspect(path string) (Info, error) {
 	if err != nil {
 		return Info{}, err
 	}
+	meta, metaOK := ReadMetadata(path)
+	created := createdFromName(filepath.Base(path), info.ModTime())
+	if metaOK && !meta.CreatedAt.IsZero() {
+		created = meta.CreatedAt
+	}
 	if newest.IsZero() {
 		newest = info.ModTime()
 	}
-	created := createdFromName(filepath.Base(path), info.ModTime())
+	template := "blank"
+	if metaOK && meta.Template != "" {
+		template = meta.Template
+	}
+	name := filepath.Base(path)
+	if metaOK && meta.Name != "" {
+		name = meta.Name
+	}
 	return Info{
-		Name:     filepath.Base(path),
+		Name:     name,
+		Template: template,
 		Path:     path,
 		Created:  created,
 		Modified: newest,
+		Expires:  meta.ExpiresAt,
 		Size:     size,
 	}, nil
+}
+
+func ReadMetadata(path string) (Metadata, bool) {
+	body, err := os.ReadFile(filepath.Join(path, MarkerFile))
+	if err != nil {
+		return Metadata{}, false
+	}
+	var meta Metadata
+	if err := json.Unmarshal(body, &meta); err != nil {
+		return Metadata{}, false
+	}
+	if meta.Version == 0 {
+		return Metadata{}, false
+	}
+	return meta, true
+}
+
+func MetadataForWorkspace(path string) Metadata {
+	meta, ok := ReadMetadata(path)
+	if ok {
+		if meta.Name == "" {
+			meta.Name = Slug(filepath.Base(path))
+		}
+		if meta.Template == "" {
+			meta.Template = "blank"
+		}
+		return meta
+	}
+	info, err := os.Stat(path)
+	created := time.Now()
+	if err == nil {
+		created = createdFromName(filepath.Base(path), info.ModTime())
+	}
+	return Metadata{
+		Version:   1,
+		Name:      Slug(filepath.Base(path)),
+		Template:  "blank",
+		CreatedAt: created,
+		ExpiresAt: nil,
+	}
+}
+
+func WriteMetadata(path string, meta Metadata) error {
+	if meta.Version == 0 {
+		meta.Version = 1
+	}
+	if meta.Template == "" {
+		meta.Template = "blank"
+	}
+	body, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	return os.WriteFile(filepath.Join(path, MarkerFile), body, 0o644)
+}
+
+func SetTTL(path string, now time.Time, ttl time.Duration) error {
+	meta := MetadataForWorkspace(path)
+	meta.ExpiresAt = expiresAt(now, ttl)
+	return WriteMetadata(path, meta)
+}
+
+func ClearTTL(path string) error {
+	meta := MetadataForWorkspace(path)
+	meta.ExpiresAt = nil
+	return WriteMetadata(path, meta)
+}
+
+func expiresAt(now time.Time, ttl time.Duration) *time.Time {
+	if ttl <= 0 {
+		return nil
+	}
+	expires := now.Add(ttl)
+	return &expires
 }
 
 func createdFromName(name string, fallback time.Time) time.Time {
